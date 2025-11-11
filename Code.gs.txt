@@ -1,0 +1,358 @@
+// Code.gs - Backend for Library Visit App (updated with visit-history endpoints)
+// Created by Saket Sharma
+
+const MEMBERS_SHEET_NAME = 'Members';
+const VISITS_SHEET_NAME = 'Visits';
+const SETTINGS_SHEET_NAME = 'Settings';
+const EXPORT_FOLDER_NAME = 'LibraryExports';
+
+function doGet(e) {
+  return HtmlService.createHtmlOutputFromFile('index').setTitle('Library Visit Log');
+}
+
+function _getSheet(name, headers) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  let sh = ss.getSheetByName(name);
+  if (!sh) {
+    sh = ss.insertSheet(name);
+    if (headers && headers.length) sh.getRange(1,1,1,headers.length).setValues([headers]);
+  }
+  if (headers && sh.getLastRow() === 0) {
+    sh.getRange(1,1,1,headers.length).setValues([headers]);
+  }
+  return sh;
+}
+
+function _ensureSheets(){
+  // Members now includes Course column (backward compatible)
+  _getSheet(MEMBERS_SHEET_NAME, ['MemberID','Name','Additional','PhotoURL','Course']);
+  _getSheet(VISITS_SHEET_NAME, ['Timestamp','MemberID','Action','Note','RecordedBy','Timezone']);
+  _getSheet(SETTINGS_SHEET_NAME, ['Key','Value']);
+}
+
+function _sheetToObjects(sheet) {
+  if (!sheet) return [];
+  const values = sheet.getDataRange().getValues();
+  if (!values || values.length < 2) return [];
+  const headers = values[0].map(h => h.toString().trim());
+  const rows = values.slice(1);
+  const out = rows.map(r => {
+    const obj = {};
+    for (let i=0;i<headers.length;i++){ obj[headers[i]] = r[i]; }
+    return obj;
+  }).filter(o => Object.values(o).some(v => v !== '' && v !== null && v !== undefined));
+  return out;
+}
+
+function getCurrentUserEmail() {
+  try {
+    const email = Session.getActiveUser().getEmail();
+    return email || '';
+  } catch (e) {
+    return '';
+  }
+}
+
+function isCurrentUserAdmin() {
+  _ensureSheets();
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const setSh = ss.getSheetByName(SETTINGS_SHEET_NAME);
+  let admins = [];
+  if (setSh) {
+    const data = _sheetToObjects(setSh);
+    const rec = data.find(r => (r.Key||'').toString().toLowerCase() === 'admins');
+    if (rec && rec.Value) admins = rec.Value.toString().split(',').map(s => s.trim()).filter(Boolean);
+  }
+  if (admins.length === 0) {
+    admins = ['libadmin@example.com']; // <-- replace with your admin email(s)
+  }
+  const me = Session.getActiveUser().getEmail();
+  return !!(me && admins.indexOf(me) !== -1);
+}
+
+/**
+ * searchMembersPrefix(query) - used by frontend typeahead
+ * Returns up to 10 matching { Name, MemberID, Additional, PhotoURL, Course }
+ */
+function searchMembersPrefix(query) {
+  _ensureSheets();
+  query = (query || '').toString().trim();
+  if (!query) return [];
+
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const mSh = ss.getSheetByName(MEMBERS_SHEET_NAME);
+  const members = _sheetToObjects(mSh);
+
+  const q = query.toLowerCase();
+
+  const candidates = members
+    .map(m => {
+      const name = (m.Name || '').toString();
+      const id = (m.MemberID || '').toString();
+      const nameLower = name.toLowerCase();
+      const idLower = id.toLowerCase();
+
+      let score = 0;
+      if (nameLower.indexOf(q) !== -1) score += 10;
+      if (idLower.indexOf(q) !== -1) score += 12;
+      if (nameLower.indexOf(q) === 0) score += 40;
+      if (idLower.indexOf(q) === 0) score += 50;
+
+      return { raw: m, score: score };
+    })
+    .filter(c => c.score > 0)
+    .sort((a,b) => b.score - a.score);
+
+  const top = candidates.slice(0, 10).map(c => {
+    const m = c.raw;
+    return {
+      Name: (m.Name || '').toString(),
+      MemberID: (m.MemberID || '').toString(),
+      Additional: (m.Additional || '').toString(),
+      PhotoURL: (m.PhotoURL || '').toString(),
+      Course: (m.Course || m.Additional || '').toString()
+    };
+  });
+
+  return top;
+}
+
+/**
+ * getMemberByIdOrName(query)
+ * Existing behavior retained; returns member info + latest summary and logSummary
+ */
+function getMemberByIdOrName(query) {
+  _ensureSheets();
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const mSh = ss.getSheetByName(MEMBERS_SHEET_NAME);
+  const members = _sheetToObjects(mSh);
+
+  const q = (query || '').toString().trim().toLowerCase();
+  if (!q) return { found: false };
+
+  // Prefer exact MemberID match
+  let row = members.find(r => (r.MemberID||'').toString().toLowerCase() === q);
+
+  // If not found, try exact name match
+  if (!row) row = members.find(r => (r.Name||'').toString().toLowerCase() === q);
+
+  // If still not found, try contains on Name
+  if (!row) row = members.find(r => (r.Name||'').toString().toLowerCase().indexOf(q) !== -1);
+
+  if (!row) return { found: false };
+
+  const vSh = ss.getSheetByName(VISITS_SHEET_NAME);
+  const visits = _sheetToObjects(vSh).filter(v => (v.MemberID||'').toString() === (row.MemberID||'').toString());
+  visits.sort((a,b) => new Date(b.Timestamp) - new Date(a.Timestamp));
+
+  const status = visits.length ? (visits[0].Action === 'IN' ? 'IN' : 'OUT') : null;
+  const lastIn = visits.find(v => v.Action === 'IN');
+  const lastOut = visits.find(v => v.Action === 'OUT');
+  let latestSummary = '';
+  if (lastIn) latestSummary += 'Last IN: ' + lastIn.Timestamp + (lastOut ? ('\nLast OUT: ' + lastOut.Timestamp) : '');
+  else if (lastOut) latestSummary += 'Last OUT: ' + lastOut.Timestamp;
+  else latestSummary = 'No previous visits';
+  const logSummary = visits.slice(0,10).map(v => `${v.Timestamp} — ${v.Action} — ${v.Note || ''}`).join('\n');
+
+  // Provide Course field to frontend if present
+  const memberOut = Object.assign({}, row);
+  memberOut.Course = (row.Course || row.Additional || '').toString();
+
+  return {
+    found: true,
+    member: memberOut,
+    status: status,
+    latest: latestSummary,
+    logSummary: logSummary
+  };
+}
+
+/**
+ * NEW: getVisitHistory(memberId, limit)
+ * Returns an array of visits for the given memberId sorted newest -> oldest.
+ * Each item: { Timestamp, MemberID, Action, Note, RecordedBy, Timezone }
+ * limit is optional (default 10). Returns [] for no visits or invalid memberId.
+ */
+function getVisitHistory(memberId, limit) {
+  _ensureSheets();
+  memberId = (memberId || '').toString();
+  limit = Math.max(1, parseInt(limit, 10) || 10);
+
+  if (!memberId) return [];
+
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const vSh = ss.getSheetByName(VISITS_SHEET_NAME);
+  const visits = _sheetToObjects(vSh)
+    .filter(v => (v.MemberID||'').toString() === memberId)
+    .map(v => ({
+      Timestamp: (v.Timestamp || '').toString(),
+      MemberID: (v.MemberID || '').toString(),
+      Action: (v.Action || '').toString(),
+      Note: (v.Note || '').toString(),
+      RecordedBy: (v.RecordedBy || '').toString(),
+      Timezone: (v.Timezone || '').toString()
+    }))
+    .sort((a,b) => new Date(b.Timestamp) - new Date(a.Timestamp));
+
+  return visits.slice(0, limit);
+}
+
+/**
+ * NEW: getMemberQuickHistory(memberId)
+ * Quick summary useful for UI badges: { lastIn, lastOut, lastAction }
+ * lastIn/lastOut are timestamp strings or null. lastAction is 'IN'|'OUT'|null
+ */
+function getMemberQuickHistory(memberId) {
+  _ensureSheets();
+  memberId = (memberId || '').toString();
+  if (!memberId) return { lastIn: null, lastOut: null, lastAction: null };
+
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const vSh = ss.getSheetByName(VISITS_SHEET_NAME);
+  const visits = _sheetToObjects(vSh)
+    .filter(v => (v.MemberID||'').toString() === memberId)
+    .sort((a,b) => new Date(b.Timestamp) - new Date(a.Timestamp));
+
+  if (!visits || visits.length === 0) return { lastIn: null, lastOut: null, lastAction: null };
+
+  const lastAction = visits[0].Action || null;
+  const lastIn = visits.find(v => v.Action === 'IN');
+  const lastOut = visits.find(v => v.Action === 'OUT');
+
+  return {
+    lastIn: lastIn ? lastIn.Timestamp : null,
+    lastOut: lastOut ? lastOut.Timestamp : null,
+    lastAction: lastAction || null
+  };
+}
+
+function recordVisit(memberId, action, note) {
+  _ensureSheets();
+  memberId = (memberId || '').toString();
+  action = (action || '').toString().toUpperCase();
+  note = (note || '').toString();
+
+  if (!memberId) return { ok: false, error: 'Missing member id' };
+  if (action !== 'IN' && action !== 'OUT') return { ok: false, error: 'Action must be IN or OUT' };
+
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const vSh = ss.getSheetByName(VISITS_SHEET_NAME);
+
+  const members = _sheetToObjects(ss.getSheetByName(MEMBERS_SHEET_NAME));
+  const memberExists = members.some(m => (m.MemberID||'').toString() === memberId);
+  if (!memberExists) return { ok: false, error: 'Member not found in Members sheet' };
+
+  const visits = _sheetToObjects(vSh).filter(r => (r.MemberID||'').toString() === memberId);
+  let lastAction = null;
+  if (visits.length) {
+    visits.sort((a,b)=> new Date(b.Timestamp) - new Date(a.Timestamp));
+    lastAction = visits[0].Action;
+  }
+
+  if (lastAction === action) {
+    return { ok: false, error: `Last action for this member is already ${action}.`};
+  }
+
+  const timestamp = new Date();
+  const tsString = Utilities.formatDate(timestamp, ss.getSpreadsheetTimeZone(), 'yyyy-MM-dd HH:mm:ss');
+  const recordedBy = Session.getActiveUser().getEmail() || 'webapp';
+  const tz = ss.getSpreadsheetTimeZone();
+  vSh.appendRow([tsString, memberId, action, note || '', recordedBy, tz]);
+
+  return { ok: true, memberId: memberId, recordedAction: action, timestamp: tsString };
+}
+
+function exportTodayVisits() {
+  _ensureSheets();
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const vSh = ss.getSheetByName(VISITS_SHEET_NAME);
+  const visits = _sheetToObjects(vSh);
+
+  const today = Utilities.formatDate(new Date(), ss.getSpreadsheetTimeZone(), 'yyyy-MM-dd');
+  const todays = visits.filter(v => (v.Timestamp || '').toString().indexOf(today) === 0);
+
+  const headers = ['Timestamp','MemberID','Action','Note','RecordedBy','Timezone'];
+  const rows = todays.map(r => headers.map(h => (r[h] || '').toString().replace(/"/g,'""')));
+  const csv = [headers.join(',')].concat(rows.map(r => r.map(c => `"${c}"`).join(','))).join('\n');
+
+  let folder;
+  const existing = DriveApp.getFoldersByName(EXPORT_FOLDER_NAME);
+  if (existing.hasNext()) folder = existing.next();
+  else folder = DriveApp.createFolder(EXPORT_FOLDER_NAME);
+
+  const fileName = `visits_${today}.csv`;
+  const file = folder.createFile(fileName, csv, MimeType.CSV);
+  file.setSharing(DriveApp.Access.ANY_WITH_LINK, DriveApp.Permission.VIEW);
+  return { url: file.getUrl() };
+}
+
+function generateDurationsReport() {
+  _ensureSheets();
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const visits = _sheetToObjects(ss.getSheetByName(VISITS_SHEET_NAME))
+                 .map(v => ({ Timestamp: new Date(v.Timestamp), MemberID: (v.MemberID||''), Action: v.Action, Note: v.Note || '' }))
+                 .sort((a,b)=> a.Timestamp - b.Timestamp);
+
+  const sessions = [];
+  const lastInByMember = {};
+
+  visits.forEach(v => {
+    const id = v.MemberID;
+    if (v.Action === 'IN') {
+      lastInByMember[id] = v.Timestamp;
+    } else if (v.Action === 'OUT') {
+      if (lastInByMember[id]) {
+        const start = lastInByMember[id];
+        const end = v.Timestamp;
+        const mins = Math.round((end - start) / 60000);
+        sessions.push({ MemberID: id, Start: start, End: end, Minutes: mins, Note: v.Note || '' });
+        delete lastInByMember[id];
+      }
+    }
+  });
+
+  const today = Utilities.formatDate(new Date(), ss.getSpreadsheetTimeZone(), 'yyyy-MM-dd');
+  const sheetName = `Durations_Report_${today}`;
+  const existingSheet = ss.getSheetByName(sheetName);
+  if (existingSheet) ss.deleteSheet(existingSheet);
+  const out = ss.insertSheet(sheetName);
+  out.appendRow(['MemberID','Start (ts)','End (ts)','Minutes','Note']);
+  sessions.forEach(s => {
+    out.appendRow([s.MemberID, Utilities.formatDate(s.Start, ss.getSpreadsheetTimeZone(), 'yyyy-MM-dd HH:mm:ss'),
+                   Utilities.formatDate(s.End, ss.getSpreadsheetTimeZone(), 'yyyy-MM-dd HH:mm:ss'),
+                   s.Minutes, s.Note]);
+  });
+
+  return { sheetUrl: ss.getUrl() + '#gid=' + out.getSheetId() };
+}
+
+function deleteOldVisits(days) {
+  _ensureSheets();
+  if (!isCurrentUserAdmin()) return 'Not authorized';
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const vSh = ss.getSheetByName(VISITS_SHEET_NAME);
+  const all = vSh.getDataRange().getValues();
+  if (!all || all.length < 2) return 'No visits';
+  const headers = all[0];
+  const rows = all.slice(1);
+  const cutoff = new Date();
+  cutoff.setDate(cutoff.getDate() - days);
+  const keep = rows.filter(r => {
+    const ts = new Date(r[0]);
+    return ts >= cutoff;
+  });
+  vSh.clearContents();
+  vSh.getRange(1,1,1,headers.length).setValues([headers]);
+  if (keep.length) vSh.getRange(2,1,keep.length, headers.length).setValues(keep);
+  return `Deleted visits older than ${days} days. Remaining rows: ${keep.length}`;
+}
+
+function addSampleMember() {
+  _ensureSheets();
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const mSh = ss.getSheetByName(MEMBERS_SHEET_NAME);
+  // Now includes Course column
+  mSh.appendRow(['1001','Rahul Kumar','BA Library Science','', 'B.A. Library']);
+  mSh.appendRow(['1002','Anita Sharma','MCA Student','', 'M.C.A.']);
+  return 'sample members added';
+}
